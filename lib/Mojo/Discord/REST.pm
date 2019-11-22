@@ -282,6 +282,35 @@ sub get_channel_webhooks
     });
 }
 
+sub get_channel_messages
+{
+    my ($self, $channel, $callback, %params) = @_;
+    my $cid = $channel->{id};
+    my ($limit, $around, $before, $after);
+    my $args = "";
+
+    die("get_channel_messages requires a channel ID") unless (defined $cid);
+
+    my $lastmid = $channel->{last_message_id};
+    
+    if (defined($lastmid)) {
+	$args = "?before=${lastmid}";
+    }
+    if (defined($params{limit})) {
+	$args .= "&limit=".$params{limit};
+    }
+
+    my $url = $self->base_url . "/channels/$cid/messages${args}";
+
+    $self->ua->get($url => sub
+    {
+	my ($ua, $tx) = @_;
+
+	$callback->($tx->res->json, $channel) if defined($callback);
+    });
+}
+   
+
 sub get_guild_webhooks
 {
     my ($self, $guild, $callback) = @_;

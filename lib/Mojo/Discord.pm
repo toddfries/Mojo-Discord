@@ -13,6 +13,25 @@ has base_url    => 'https://discordapp.com/api';
 has gw          => sub { Mojo::Discord::Gateway->new(shift) };
 has rest        => sub { Mojo::Discord::REST->new(shift) };
 
+my %ctypes = (
+	'0' => 'GUILD_TEXT',
+	'1' => 'DM',
+	'2' => 'GUILD_VOICE',
+	'3' => 'GROUP_DM',
+	'4' => 'GUILD_CATEGORY',
+	'5' => 'GUILD_NEWS',
+	'6' => 'GUILD_STORE',
+);
+my %cnames = (
+	'0' => 'TEXT',
+	'1' => 'DM',
+	'2' => 'VOICE',
+	'3' => 'GDM',
+	'4' => 'CATEGORY',
+	'5' => 'NEWS',
+	'6' => 'STORE',
+);
+
 sub init
 {
     my $self = shift;
@@ -127,11 +146,24 @@ sub get_channel_webhooks
     $self->rest->get_channel_webhooks($channel, $callback);
 }
 
+sub get_channel_messages
+{
+    my ($self, $channel, $callback, %params) = @_;
+
+    $self->rest->get_channel_messages($channel, $callback, %params);
+}
+
 sub get_guild_webhooks
 {
     my ($self, $guild, $callback) = @_;
 
     $self->rest->get_guild_webhooks($guild, $callback);
+}
+
+sub ctype_to_name
+{
+    my ($self, $ctype) = @_;
+    return $cnames{$ctype};
 }
 
 1;
