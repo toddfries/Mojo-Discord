@@ -418,7 +418,16 @@ sub send_ident
             '$referring_domain' => ""
         }, 
         "compress" => \1, 
-        "large_threshold" => 50
+        "large_threshold" => 250,
+	"presence" => {
+	    "game"=> {
+		"name"=> "Thinking Cap",
+		"type"=> 0
+	    },
+	    "status"=> "dnd",
+	    "since" => 1581034745,
+	    "afk" => 0
+         }
     };
 
     say localtime(time) . " OP 2 SEQ 0 IDENTIFY" if $self->verbose;
@@ -447,6 +456,11 @@ sub callback
 {
     my ($self, $event, $hash) = @_;
     my $callbacks = $self->callbacks;
+
+    if ( !defined($event)) {
+	say localtime(time) . ": No event defined" if $self->verbose;
+	return;
+    }
 
     if ( exists $callbacks->{$event} )
     {
