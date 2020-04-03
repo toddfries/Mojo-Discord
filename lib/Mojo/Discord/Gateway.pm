@@ -284,6 +284,8 @@ sub on_finish
     {
         say localtime(time) . " (on_finish) \$tx is unexpectedly undefined.";
         die("\$tx is not defined. Cannot recover automatically.");
+    } elsif ( !ref($tx) ) {
+	die("\$tx is ${tx}. Cannot recover automatically.");
     }
     elsif (!$tx->is_finished)
     {
