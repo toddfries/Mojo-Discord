@@ -1,47 +1,55 @@
 # Mojo::Discord
 
-This is a set of Perl Modules designed to implement parts of the Discord public API, build on Mojo::IOLoop.
+This is a set of Perl Modules designed to implement parts of the Discord public API, build on Mojo::UserAgent and Mojo::IOLoop.
 
-There are four modules involved
+## Modules
 
-- **Mojo::Discord::Auth** handles OAuth2
-- **Mojo::Discord::Gateway** handles the Websocket realtime event monitoring part (connect and monitor the chat)
-- **Mojo::Discord::REST** handles calls to the REST web API, which mostly handles actions you want the bot to take
-- **Mojo::Discord** is a wrapper that saves the user the trouble of managing both REST and Gateway APIs manually.
+The primary modules involved are:
+
+- **Mojo::Discord** - A top level wrapper and single point of entry for all other modules
+- **Mojo::Discord::Auth** - OAuth 2 implementation (largely incomplete)
+- **Mojo::Discord::REST** - REST API wrapper
+- **Mojo::Discord::Gateway** - Discord Websocket client implementation
+- **Mojo::Discord::User** - Discord User object, stores properties about users
+- **Mojo::Discord::Guild** - Manage all properties related to guilds (Servers)
 
 ## Note: This is a spare-time project
 
-I offer no promises as to code completion, timeline, or even support. If you have questions I will try to answer.
+I offer no promises as to code completion, timeline, support, or stability. 
 
+You should consider this module HIGHLY VOLATILE and should not rely on it for production code.
 
-## Second Note: Amateur code warning
-
-I would recommend not building anything on this code for now. It is lacking in documentation, error handling, and other things.
-I hope to improve this over time, but again because it's a side project I can only do so much with the time I have.
+You are welcome to submit pull requests if you want to build support parts of the API that I have not covered. The API is quite large and there are many aspects of it I have no plans to use and may not ever implement here.
 
 ## Pre-Requisites
 
 - **Mojo::UserAgent**  and **Mojo::IOLoop** to provide non-blocking asynchronous HTTP calls and websocket functionality.
+- **Mojo::UserAgent::Role::Queued** provides connection and rate limiting support for Mojo::UserAgent.
 - **Compress::Zlib**, as some of the incoming messages are compressed Zlib blobs
 - **Mojo::JSON** to convert the compressed JSON messages into Perl structures.
+- **Mojo::Util** to handle base64 avatar data conversion.
+- **Mojo::Log** for the library to log events to disk.
+- **JSON::MaybeXS** for proper escaping of unicode characters so discord will encode them correctly.
 - **Encode::Guess** to determine whether we're dealing with a compressed stream or not.
-- **IO::Socket::SSL** is required to fetch the Websocket URL for Discord to connect to.
+- **Data::Dumper** to debug complex objects.
+- **IO::Socket::SSL** to fetch the Websocket URL for Discord to connect to.
+- **Role::EventEmitter** to replace callbacks and allow client applications to subscribe to various Discord events.
+- **URI::Escape** to pass Unicode to the REST API endpoints, eg emojis.
+- **Time::Duration** to calculation durations between timestamps, eg for connection uptime.
 
-### Example Program
+These dependencies can be installed using cpanminus with the following command in the project root:
+    
+    cpanm --installdeps .
 
-This application creates a very basic AI Chat Bot using the Hailo module (a modern implementation of MegaHAL)
-
-Rather than in-lining the code in the README, you can find the example program in [hailobot.pl](example/hailobot.pl). A [sample config file](/example/config.ini) is included. You just need to give it a valid Discord bot token.
 
 ## Mojo::Discord::Gateway
 
 The Discord "Gateway" is a persistent Websocket connection that sends out events as they happen to all connected clients.
-This module monitors the gateway and parses events, although once connected it largely reverts to simply passing the contents of each message to the appropriate callback function, as defined by the user.
+This module monitors the gateway and parses all of the events it dispatches. The library stores information from some of these events to help it function and offer certain capabilities, but many of the events are simply re-emitted (Role::EventEmitter) to the client for it to use that information how it pleases. Clients can subscribe to these events if they wish to receive them.
 
 The connection process goes a little like this:
 
 1. Request a Gateway URL to connect to
-    a. Seems to always return the same URL now, but in the past it looks like they had multiple URLs and servers.
 2. Open a websocket connection to the URL received in Step 1.
 3. Once connected, send an IDENTIFY message to the server containing info about who we are (Application-wise)
 4. Gateway sends us a READY message containing (potentially) a ton of information about our user identity, the servers we are connected to, a heartbeat interval, and so on.
@@ -81,9 +89,8 @@ use v5.10;
 use warnings;
 use strict;
 
-use Mojo::UserAgent;
-use Mojo::Discord::Auth;
-use Data::Dumper
+use Mojo::Discord;
+use Data::Dumper;
 
 my $params = {
     'name' => 'Your Application Name',

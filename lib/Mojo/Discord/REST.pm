@@ -1,37 +1,136 @@
 package Mojo::Discord::REST;
-
+use feature 'say';
 our $VERSION = '0.001';
 
-use Mojo::Base -base;
+use Moo;
+use strictures 2;
+
+extends 'Mojo::Discord';
 
 use Mojo::UserAgent;
 use Mojo::Util qw(b64_encode);
+use URI::Escape;
 use Data::Dumper;
+use Carp;
 
-has ['token', 'name', 'url', 'version'];
-has base_url    => 'https://discordapp.com/api';
-has agent       => sub { $_[0]->name . ' (' . $_[0]->url . ',' . $_[0]->version . ')' };
-has ua          => sub { Mojo::UserAgent->new };
+use namespace::clean;
 
-# Custom Constructor to set transactor name and insert token into every request
-sub new
+has 'token'         => ( is => 'ro' );
+has 'name'          => ( is => 'rw', required => 1 );
+has 'url'           => ( is => 'rw', required => 1 );
+has 'version'       => ( is => 'ro', required => 1 );
+has 'base_url'      => ( is => 'ro', default => 'https://discordapp.com/api' );
+has 'agent'         => ( is => 'lazy', builder => sub { my $self = shift; return $self->name . ' (' . $self->url . ',' . $self->version . ')' } );
+has 'ua'            => ( is => 'lazy', builder => sub 
+                        { 
+                            my $self = shift;
+                            my $ua = Mojo::UserAgent->new;
+                            $ua->transactor->name($self->agent);
+                            $ua->inactivity_timeout(120);
+                            $ua->connect_timeout(5);
+                            $ua->on(start => sub {
+                                my ($ua, $tx) = @_;
+                                $tx->req->headers->authorization("Bot " . $self->token);
+                            });
+                            return $ua;
+                        });
+has 'log'           => ( is => 'ro' );
+has 'rate_limits'   => ( is => 'rwp', default => sub { {} } );
+has 'rate_buckets'  => ( is => 'rwp', default => sub { {} } );
+
+# Every REST call returns rate limit information in the header
+# There is a global rate limit, but also a "per-route" limit
+# This means we need to interogate the headers on every response.
+# See the Discord API docs for more details.
+#
+# This sub is just responsible for recording the returned rate limits, not to enforce them.
+# It overrides the default setter for rate_limits so you can just pass in a Mojo::Header object and not worry about it.
+sub _set_route_rate_limits
 {
-    my $self = shift->SUPER::new(@_);
+    my ($self, $route, $headers) = @_;
 
-    $self->ua->transactor->name($self->agent);
-    $self->ua->on(start => sub {
-        my ($ua, $tx) = @_;
-        $tx->req->headers->authorization("Bot " . $self->token);
-    });
+    my $bucket = $headers->header('x-ratelimit-bucket');
 
-    return $self;
+    if ( $bucket )
+    {
+        $self->rate_buckets->{$route} = $bucket;
+
+        $self->rate_limits->{$bucket}{'limit'} = $headers->header('x-ratelimit-limit');
+        $self->rate_limits->{$bucket}{'reset'} = $headers->header('x-ratelimit-reset');
+        $self->rate_limits->{$bucket}{'remaining'} = $headers->header('x-ratelimit-remaining');
+        $self->rate_limits->{$bucket}{'reset_after'} = $headers->header('x-ratelimit-reset-after');
+
+        $self->log->debug('[REST.pm] [_set_route_rate_limits] Setting rate limits for Bucket ID ' . $bucket);
+    }
+    # Else, Discord didn't return x-ratelimit-bucket headers.
+    # This happens when we first connect, and to my knowledge is safe to ignore.
+    else
+    {
+        #say Data::Dumper->Dump([$headers], ['headers']);
+    }
+}
+
+# We should also be checking the rate limits (if known) for a route before we send a request.
+# This returns the time until this bucket is allowed to send another message.
+# If we are not rate limited (or don't have rate limits for this route yet), it will return zero.
+sub _rate_limited
+{
+    my ($self, $route) = @_;
+
+    my $bucket_id = $self->rate_buckets->{$route};
+    return undef unless $bucket_id;
+
+    my $bucket = $self->rate_limits->{$bucket_id};
+    return undef unless $bucket;
+
+
+    my $remaining = $bucket->{'remaining'};
+    my $reset_after = $bucket->{'reset'} - time;
+
+    $self->log->debug('[REST.pm] [_rate_limited] Bucket ID ' . $bucket_id . ' . Quota ' . $remaining . ' Reset In ' . $reset_after . ' seconds');
+
+    ( $remaining > 0 or $reset_after < 0 ) ? return undef : return $reset_after;
+}
+
+# Validate the format of any channel, user, guild or similar ID.
+# Make sure it's defined, numeric, and positive.
+# Returns 1 if it passes everything.
+sub _valid_id
+{
+    my ($self, $s, $id) = @_;
+
+    unless ( defined $s )
+    {
+        $self->log->warn('[REST.pm] [_valid_id] Received no parameters');
+        return undef;
+    }
+
+    unless ( defined $id )
+    {
+        $self->log->warn('[REST.pm] [' . $s . '] $id is undefined');
+        return undef;
+    }
+
+    unless ( $id =~ /^\d+$/ )
+    {
+        $self->log->warn('[REST.pm] [' . $s . '] $id (' . $id . ') is not numeric');
+        return undef;
+    }
+
+    unless ( $id > 0 )
+    {
+        $self->log->debu('[REST.pm] [' . $s . '] $id (' . $id . ') cannot be a negative number');
+        return undef;
+    }
+
+    return 1;
 }
 
 # send_message will check if it is being passed a hashref or a string.
 # This way it is simple to just send a message by passing in a string, but it can also support things like embeds and the TTS flag when needed.
 sub send_message
 {
-    my ($self, $dest, $param, $callback) = @_;
+    my ($self, $dest, $param, $callback) = @_; 
 
     my $json;
 
@@ -51,15 +150,24 @@ sub send_message
         };
     }
 
-    my $post_url = $self->base_url . "/channels/$dest/messages";
-    $self->ua->post($post_url => {Accept => '*/*'} => json => $json => sub
+    my $route = "POST /channels/$dest";
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [send_message] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->send_message($dest, $param, $callback) });
+    }
+    else
+    {
+        my $post_url = $self->base_url . "/channels/$dest/messages";
+        $self->ua->post($post_url => {Accept => '*/*'} => json => $json => sub
+        {
+            my ($ua, $tx) = @_;
 
-        #say Dumper($tx->res->json);
+            $self->_set_route_rate_limits($route, $tx->res->headers);
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub edit_message
@@ -84,15 +192,24 @@ sub edit_message
         };
     }
 
-    my $post_url = $self->base_url . "/channels/$dest/messages/$msgid";
-    $self->ua->patch($post_url => {DNT => '1'} => json => $json => sub
+    my $route = "PATCH /channels/$dest";
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [edit_message] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->edit_message($dest, $param, $callback) });
+    }
+    else
+    {
+        my $post_url = $self->base_url . "/channels/$dest/messages/$msgid";
+        $self->ua->patch($post_url => {DNT => '1'} => json => $json => sub
+        {
+            my ($ua, $tx) = @_;
 
-        #say Dumper($tx->res->json);
+            $self->_set_route_rate_limits($route, $tx->res->headers);
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub delete_message
@@ -117,15 +234,24 @@ sub delete_message
         };
     }
 
-    my $post_url = $self->base_url . "/channels/$dest/messages/$msgid";
-    $self->ua->delete($post_url => {DNT => '1'} => json => $json => sub
+    my $route = "DELETE /channels/$dest";
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [delete_message] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->delete_message($dest, $param, $callback) });
+    }
+    else
+    {
+        my $post_url = $self->base_url . "/channels/$dest/messages/$msgid";
+        $self->ua->delete($post_url => {DNT => '1'} => json => $json => sub
+        {
+            my ($ua, $tx) = @_;
 
-        #say Dumper($tx->res->json);
+            $self->_set_route_rate_limits($route, $tx->res->headers);
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub set_topic
@@ -135,50 +261,167 @@ sub set_topic
     my $json = {
         'topic' => $topic
     };
-    $self->ua->patch($url => {Accept => '*/*'} => json => $json => sub
+
+    my $route = "PATCH /channels/$channel";
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
-        $callback->($tx->res->json) if defined $callback;
+        $self->log->warn('[REST.pm] [set_topic] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->set_topic($channel, $topic, $callback) });
+    }
+    else
+    {
+        $self->ua->patch($url => {Accept => '*/*'} => json => $json => sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
+}
+
+# Send "acknowledged" DM 
+# aka, acknowledge a command by adding a :white_check_mark: reaction to it and then send a DM
+# Takes a channel ID and message ID to react to, a user ID to DM, a message to send, and an optional callback sub.
+sub send_ack_dm
+{
+    my ($self, $channel_id, $message_id, $user_id, $message, $callback) = @_;
+
+    $self->rest->add_reaction($channel_id, $message_id, uri_escape_utf8("\x{2705}"));
+    $self->send_dm($user_id, $message, $callback);
+}
+
+# Just a shortcut which handles creating the DM for the caller.
+sub send_dm
+{
+    my ($self, $user, $message, $callback) = @_;
+
+    $self->create_dm($user, sub
+    {
+        my $json = shift;
+        my $dm = $json->{'id'};
+
+        $self->log->debug('[REST.pm] [send_dm] Sending DM to user ID ' . $user . ' in DM ID ' . $dm);
+
+        $self->send_message($dm, $message, $callback);
     });
+}
+
+sub create_dm
+{
+    my ($self, $id, $callback) = @_;
+
+    my $url = $self->base_url . '/users/@me/channels';
+    my $json = {
+        'recipient_id' => $id
+    };
+
+    my $route = 'POST /users';
+    if ( my $delay = $self->_rate_limited($route))
+    {
+        $self->log->warn('[REST.pm] [create_dm] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->create_dm($id, $callback) });
+    }
+    else
+    {
+        $self->ua->post($url => {Accept => '*/*'} => json => $json => sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub get_user
 {
     my ($self, $id, $callback) = @_;
 
-    my $url = $self->base_url . "/users/$id";
-    $self->ua->get($url => sub
+    unless ( $self->_valid_id('get_user', $id) )
     {
-        my ($ua, $tx) = @_;
+        $callback->(undef) if defined $callback;
+        return;
+    }
 
-        #say Dumper($tx->res->json);
+    my $route = 'GET /users';
+    if ( my $delay = $self->_rate_limited($route))
+    {
+        $self->log->warn('[REST.pm] [get_user] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->get_user($id, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/users/$id";
+        $self->ua->get($url => sub
+        {
+            my ($ua, $tx) = @_;
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
+
+sub get_user_p
+{
+    my ($self, $id) = @_;
+    my $promise = Mojo::Promise->new;
+
+    $self->get_user($id, sub { $promise->resolve(shift) });
+
+    return $promise;
+};
 
 sub leave_guild
 {
     my ($self, $user, $guild, $callback) = @_;
 
-    my $url = $self->base_url . "/users/$user/guilds/$guild";
-    $self->ua->delete($url => sub {
-        my ($ua, $tx) = @_;
-        $callback->($tx->res->body) if defined $callback;
-    });
+    my $route = 'DELETE /users';
+    if ( my $delay = $self->_rate_limited($route))
+    {
+        $self->log->warn('[REST.pm] [leave_guild] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->leave_guild($user, $guild, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/users/$user/guilds/$guild";
+        $self->ua->delete($url => sub {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->body) if defined $callback;
+        });
+    }
 }
 
 sub get_guilds
 {
     my ($self, $user, $callback) = @_;
 
-    my $url = $self->base_url . "/users/$user/guilds";
-
-    return $self->ua->get($url => sub
+    my $route = 'GET /users';
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
-        $callback->($tx->res->json) if defined $callback;
-    });
+        $self->log->warn('[REST.pm] [get_guilds] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->get_guilds($user, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/users/$user/guilds";
+
+        return $self->ua->get($url => sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 # Tell the channel that the bot is "typing", aka thinking about a response.
@@ -186,13 +429,25 @@ sub start_typing
 {
     my ($self, $dest, $callback) = @_;
 
-    my $typing_url = $self->base_url . "/channels/$dest/typing";
-
-    $self->ua->post($typing_url, sub
+    my $route = "POST /channels/$dest";
+    if ( my $delay = $self->_rate_limited($route))
     {
-        my ($ua, $tx) = @_;
-        $callback->($tx->res->body) if defined $callback;
-    });
+        $self->log->warn('[REST.pm] [start_typing] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->start_typing($dest, $callback) });
+    }
+    else
+    {
+        my $typing_url = $self->base_url . "/channels/$dest/typing";
+
+        $self->ua->post($typing_url, sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->body) if defined $callback;
+        });
+    }
 }
 
 # Create a new Webhook
@@ -228,19 +483,32 @@ sub create_webhook
     my $type = ( $avatar_file =~ /.png$/ ? 'png' : 'jpeg' ) if defined $avatar_file;
     $json->{'avatar'} = "data:image/$type;base64," . $base64 if defined $base64;
 
-    # Next, call the endpoint
-    my $url = $self->base_url . "/channels/$channel/webhooks";
-    if ( defined $callback )
+
+    my $route = "POST /channels/$channel";
+    if ( my $delay = $self->_rate_limited($route) )
     {
-        $self->ua->post($url => json => $json => sub
-        {
-            my ($ua, $tx) = @_;
-            $callback->($tx->res->json);
-        });
+        $self->log->warn('[REST.pm] [create_webhook] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->create_webhook($channel, $params, $callback) });
     }
     else
     {
-        return $self->ua->post($url => json => $json);
+        # Next, call the endpoint
+        my $url = $self->base_url . "/channels/$channel/webhooks";
+        if ( defined $callback )
+        {
+            $self->ua->post($url => json => $json => sub
+            {
+                my ($ua, $tx) = @_;
+
+                $self->_set_route_rate_limits($route, $tx->res->headers);
+
+                $callback->($tx->res->json);
+            });
+        }
+        else
+        {
+            return $self->ua->post($url => json => $json);
+        }
     }
 }
 
@@ -258,12 +526,23 @@ sub send_webhook
         $params = {'content' => $params};
     }
 
-    $self->ua->post($url => json => $params => sub
+    my $route = "POST /webhooks/$id";
+    if ( my $delay = $self->_rate_limited($route) )
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [send_webhook] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->send_webhook($channel, $hook, $params, $callback) });
+    }
+    else
+    {
+        $self->ua->post($url => json => $params => sub
+        {
+            my ($ua, $tx) = @_;
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub get_channel_webhooks
@@ -272,14 +551,24 @@ sub get_channel_webhooks
 
     die("get_channel_webhooks requires a channel ID") unless (defined $channel);
 
-    my $url = $self->base_url . "/channels/$channel/webhooks";
-
-    $self->ua->get($url => sub
+    my $route = "GET /channels/$channel";
+    if ( my $delay = $self->_rate_limited($route) )
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [get_channel_webhooks] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->get_channel_webhooks($channel, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/channels/$channel/webhooks";
+        $self->ua->get($url => sub
+        {
+            my ($ua, $tx) = @_;
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub get_channel_messages
@@ -317,29 +606,193 @@ sub get_guild_webhooks
 
     die("get_guild_webhooks requires a guild ID") unless (defined $guild);
 
-    my $url = $self->base_url . "/guilds/$guild/webhooks";
-
-    $self->ua->get($url => sub
+    my $route = "GET /guilds/$guild";
+    if ( my $delay = $self->_rate_limited($route) )
     {
-        my ($ua, $tx) = @_;
+        $self->log->warn('[REST.pm] [get_guild_webhooks] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->get_guild_webhooks($guild, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/guilds/$guild/webhooks";
 
-        $callback->($tx->res->json) if defined $callback;
-    });
+        $self->ua->get($url => sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
 sub add_reaction
 {
     my ($self, $channel, $msgid, $emoji, $callback) = @_;
 
-    my $url = $self->base_url . "/channels/$channel/messages/$msgid/reactions/$emoji/\@me";
-    my $json;
-    
-    $self->ua->put($url => {Accept => '*/*'} => json => $json => sub
-    {   
-        my ($ua, $tx) = @_;
+    my $route = "GET /channels/$channel";
+    if ( my $delay = $self->_rate_limited($route) )
+    {
+        $self->log->warn('[REST.pm] [add_reaction] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->add_reaction($channel, $msgid, $emoji, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/channels/$channel/messages/$msgid/reactions/$emoji/\@me";
+        my $json;
         
-        $callback->($tx->res->json) if defined $callback;
-    });
+        $self->ua->put($url => {Accept => '*/*'} => json => $json => sub
+        {   
+            my ($ua, $tx) = @_;
+    
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
 }
 
+sub get_audit_log
+{
+    my ($self, $guild_id, $callback) = @_;
+
+    my $route = "GET /guilds/$guild_id";
+    if ( my $delay = $self->_rate_limited($route) )
+    {
+        $self->log->warn('[REST.pm] [get_audit_log] Route is rate limited. Trying again in ' . $delay . ' seconds');
+        Mojo::IOLoop->timer($delay => sub { $self->get_audit_log($guild_id, $callback) });
+    }
+    else
+    {
+        my $url = $self->base_url . "/guilds/$guild_id/audit-logs";
+        
+        $self->ua->get($url => sub
+        {
+            my ($ua, $tx) = @_;
+
+            $self->_set_route_rate_limits($route, $tx->res->headers);
+
+            $callback->($tx->res->json) if defined $callback;
+        });
+    }
+}
+
+
+
 1;
+
+=head1 NAME
+
+Mojo::Discord::REST - An implementation of the Discord Public REST API endpoints
+
+=head1 SYNOPSIS
+
+```perl
+#!/usr/bin/env perl
+
+use v5.10;
+use strict;
+use warnings;
+
+my $rest = Mojo::Discord::REST->new(
+    'token'         => 'token-string',
+    'name'          => 'client-name',
+    'url'           => 'my-website',
+    'version'       => '1.0',
+    'log'           => Mojo::Log->new(
+                            path    => '/path/to/logs/rest.log',
+                            level   => 'DEBUG',
+                        ),
+);
+
+$rest->get_user('1234567890', sub { my $json = shift; say $json->{'id'} });
+```
+
+=head1 DESCRIPTION
+
+L<Mojo::Discord::REST> wrapper for the Discord REST API endpoints.
+
+It requires a discord token, and some of the calls require you to be connected to a Discord Gateway as well (eg, sending messages)
+
+Typically you would not interact with this module directly, as L<Mojo::Discord> functions as a wrapper for this and related modules.
+
+All calls accept an optional callback parameter, which this module will use to provide return values.
+
+=head1 PROPERTIES
+
+L<Mojo::Discord::REST> requires the following to be passed in on instantiation
+
+=head2 token
+    This is a Discord Bot token generated by the Discord API. 
+
+=head2 name
+    This name is only used in the Mojo::UserAgent agent name, it does not determine the bot's username.
+
+=head2 url
+    A URL relevant to your bot - perhaps a github repo or a public website.
+
+=head2 version
+    The version of your client application
+
+=head2 log
+    A Mojo::Log object the module can use to write to disk
+
+=head1 ATTRIBUTES
+
+L<Mojo::Discord::REST> provides these attributes beyond what is passed in at creation.
+
+=head2 agent
+    The useragent string used by Mojo::UserAgent to identify itself
+
+=head2 ua
+    The Mojo::UserAgent object used to make calls to the Discord REST API endpoints
+
+=head1 SUBROUTINES
+
+L<Mojo::Discord::REST> provides the following subs you may want to leverage
+
+=head2 send_message
+    Accepts a channel ID, a message to send, and an optional callback sub.
+    The message can either be a string of text to send to the channel, or it can be a JSON string of a discord MESSAGE payload. The latter offers you low level control over the message contents.
+
+    ```perl
+    $rest->send_message($channel, 'Test message please ignore');
+    ```
+
+=head2 edit_message
+    Accepts a channel ID, a message ID, an updated message, and an optional callback
+    Like send_message, the updated messaage can be either a simple string or it can be a JSON discord MESSAGE payload
+
+=head2 delete_message
+    Accepts a channel ID, a message ID, 
+
+
+
+=head1 BUGS
+
+Report issues on github
+
+https://github.com/vsTerminus/Mojo-Discord
+
+=head1 CONTRIBUTE
+
+Contributions are welcomed via Github pull request
+
+https://github.com/vsTerminus/Mojo-Discord
+
+=head1 AUTHOR
+
+Travis Smith <tesmith@cpan.org>
+
+=head1 COPYRIGHT AND LICENSE
+This software is Copyright (c) 2017-2020 by Travis Smith.
+
+This is free software, licensed under:
+
+  The MIT (X11) License
+
+=head1 SEE ALSO
+
+- L<Mojo::UserAgent>
+- L<Mojo::IOLoop>
